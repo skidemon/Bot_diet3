@@ -25,7 +25,7 @@ whisper_model = whisper.load_model("base")
 def init_db():
     conn = sqlite3.connect("diet_diary.db")
     cursor = conn.cursor()
-    
+
     # Дневник питания
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS entries (
@@ -39,8 +39,8 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    # Бады
+
+    # Таблица бадов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS supplements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,16 +113,15 @@ def extract_nutrition(text):
             return float(match.group(1))
 
     text = str(text).lower()
-    
-    # Ищем "итог" или "общее количество"
-    summary_start = re.search(r"(?:итог|общее|сумма|всего)[^\d]*(\d+)", text, flags=re.DOTALL)
+
+    summary_start = re.search(r"(?:итог|общее количество|сумма)[^\d]*(\d+)", text, flags=re.DOTALL)
     if summary_start:
         text = text[summary_start.start():]
 
-    calories = re.search(r"(?:калории|ккал|энергия)[^\d]*(\d+\.?\d*)", text)
-    proteins = re.search(r"(?:белки|протеины|жир|липиды)[^\d]*(\d+\.?\d*)", text)
-    fats = re.search(r"(?:жиры|жир|липиды)[^\d]*(\d+\.?\d*)", text)
-    carbs = re.search(r"(?:углеводы|углевода)[^\d]*(\d+\.?\d*)", text)
+    calories = re.search(r"(калории|ккал)[^\d]*(\d+\.?\d*)", text, re.IGNORECASE)
+    proteins = re.search(r"(белки|белок)[^\d]*(\d+\.?\d*)", text, re.IGNORECASE)
+    fats = re.search(r"(жиры|жир)[^\d]*(\d+\.?\d*)", text, re.IGNORECASE)
+    carbs = re.search(r"(углеводы|углевода)[^\d]*(\d+\.?\d*)", text, re.IGNORECASE)
 
     return {
         "calories": round(parse_value(calories.group(0)) if calories else 0, 1),
@@ -165,8 +164,34 @@ def get_entries_today(user_id):
     """, (user_id,))
     return cursor.fetchall()
 
+# === Получение всех бадов пользователя ===
+def get_all_supplements(user_id):
+    conn = sqlite3.connect("diet_diary.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM supplements WHERE user_id = ?", (user_id,))
+    return [row[0] for row in cursor.fetchall()]
+
+# === Сохранение бада в справочнике ===
+def save_supplement(user_id, name, description, calories, proteins, fats, carbs):
+    conn = sqlite3.connect("diet_diary.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO supplements
+        (user_id, name, description, calories, proteins, fats, carbs)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, name, description, calories, proteins, fats, carbs))
+    conn.commit()
+
+# === Получение бада по имени ===
+def get_supplement(user_id, name):
+    conn = sqlite3.connect("diet_diary.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM supplements WHERE user_id = ? AND name = ?", (user_id, name))
+    return cursor.fetchone()
+
 # === Обработка входящего сообщения ===
 current_analysis = {}  # Хранилище анализа перед подтверждением
+user_states = {}       # Для пошагового диалога
 
 def handle_message(update):
     message = update.get("message", {})
@@ -186,9 +211,7 @@ def handle_message(update):
         download_file(file_path, download_path)
 
         raw_text = voice_to_text_local(download_path)
-        
-        # Шаг 2: Теперь просим AI рассчитать калории
-        analysis = analyze_with_qwen(f"Сколько калорий и БЖУ в '{raw_text}'?")
+        analysis = analyze_with_qwen(f"Что съел пользователь и сколько калорий и БЖУ? '{raw_text}'")
         nutrients = extract_nutrition(analysis)
 
         current_analysis[chat_id] = {
@@ -205,17 +228,10 @@ def handle_message(update):
                  {"text": "❌ Удалить", "callback_data": "save_no"}]
             ]
         }
-        send_message(chat_id, f"""
-Вы сказали: "{raw_text}"
+        msg = send_message(chat_id, f"Вы сказали: '{raw_text}'\n\nКалории: {nutrients['calories']} ккал\nБелки: {nutrients['proteins']} г\nЖиры: {nutrients['fats']} г\nУглеводы: {nutrients['carbs']} г\n\nСохранить в дневнике?", buttons)
 
-📊 Анализ:
-Калории: {nutrients['calories']} ккал
-Белки: {nutrients['proteins']} г
-Жиры: {nutrients['fats']} г
-Углеводы: {nutrients['carbs']} г
-
-Хотите сохранить это в дневнике?
-""", buttons)
+        if msg and "result" in msg:
+            current_analysis[chat_id]["message_id"] = msg["result"]["message_id"]
 
     # Фото
     elif photo:
@@ -226,7 +242,7 @@ def handle_message(update):
         download_path = "user_food.jpg"
         download_file(file_path, download_path)
 
-        analysis = analyze_with_qwen("Опиши продукты на фото. Разложи их на ингредиенты. Рассчитай калории и БЖУ каждого, затем итог.")
+        analysis = analyze_with_qwen("Опиши продукты на фото. Рассчитай суммарные калории и БЖУ.", image_path=download_path)
         nutrients = extract_nutrition(analysis)
 
         current_analysis[chat_id] = {
@@ -243,7 +259,10 @@ def handle_message(update):
                  {"text": "❌ Удалить", "callback_data": "save_no"}]
             ]
         }
-        send_message(chat_id, f"На фото: {analysis}\n\nКалории: {nutrients['calories']} ккал\nБелки: {nutrients['proteins']} г\nЖиры: {nutrients['fats']} г\nУглеводы: {nutrients['carbs']} г\n\nЗапомнить как съеденное?", buttons)
+        msg = send_message(chat_id, f"На фото: {analysis}\n\nКалории: {nutrients['calories']} ккал\nБелки: {nutrients['proteins']} г\nЖиры: {nutrients['fats']} г\nУглеводы: {nutrients['carbs']} г\n\nЗапомнить как съеденное?", buttons)
+
+        if msg and "result" in msg:
+            current_analysis[chat_id]["message_id"] = msg["result"]["message_id"]
 
     # Текстовое сообщение
     elif text:
@@ -251,8 +270,8 @@ def handle_message(update):
             start_msg = """
 👋 Привет! Я помогу тебе считать калории и БЖУ.
 
-📸 Пришли фото еды  
-🎙 Запиши голосом, что ты ел  
+📸 Пришли фото еды
+🎙 Запиши голосом, что ты ел
 📝 Или просто напиши мне
 
 А ещё я могу запомнить твои любимые блюда и бады!
@@ -261,25 +280,39 @@ def handle_message(update):
             show_main_menu(chat_id)
 
         elif text.startswith("/add_supplement"):
-            _, name = text.split(maxsplit=1)
-            analysis = analyze_with_qwen(f"Опиши состав этого бада: '{name}'. Сколько калорий, белков, жиров, углеводов в одной порции?")
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                send_message(chat_id, "❌ Укажите название бада после команды.\nПример: /add_supplement Витамин D3")
+                return
+
+            _, name = parts
+            analysis = analyze_with_qwen(f"Опиши состав этого бада: '{name}'. Сколько калорий, белков, жиров, углеводов?")
             nutrients = extract_nutrition(analysis)
             save_supplement(from_id, name, analysis, nutrients["calories"], nutrients["proteins"], nutrients["fats"], nutrients["carbs"])
             send_message(chat_id, f"✅ Бад '{name}' добавлен:\n{analysis}")
 
         elif text.startswith("/take"):
-            _, name = text.split(maxsplit=1)
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                supplements = get_all_supplements(from_id)
+                if not supplements:
+                    send_message(chat_id, "❌ У вас пока нет сохранённых бадов.")
+                    return
+
+                buttons = {"inline_keyboard": []}
+                for name in supplements:
+                    buttons["inline_keyboard"].append([{
+                        "text": name,
+                        "callback_data": f"take_{name}"
+                    }])
+                buttons["inline_keyboard"].append([{"text": "⬅️ Назад", "callback_data": "back"}])
+                send_message(chat_id, "Выберите бад для приёма:", buttons)
+                return
+
+            _, name = parts
             supplement = get_supplement(from_id, name)
             if supplement:
-                entry_data = {
-                    "user_id": from_id,
-                    "text": f"Принят бад: {name}",
-                    "calories": supplement[3],
-                    "proteins": supplement[4],
-                    "fats": supplement[5],
-                    "carbs": supplement[6]
-                }
-                save_entry(**entry_data)
+                save_entry(from_id, f"Принят бад: {name}", supplement[3], supplement[4], supplement[5], supplement[6])
                 send_message(chat_id, f"✅ Вы приняли '{name}'. Записано в дневник.")
             else:
                 send_message(chat_id, f"❌ Бад '{name}' не найден.")
@@ -333,12 +366,14 @@ def handle_message(update):
                 "fats": scaled_nutrients["fats"],
                 "carbs": scaled_nutrients["carbs"]
             }
+
             buttons = {
                 "inline_keyboard": [
                     [{"text": "✅ Сохранить", "callback_data": "save_yes"},
                      {"text": "❌ Удалить", "callback_data": "save_no"}]
                 ]
             }
+
             send_message(chat_id, f"Вы написали: '{text}'\n\nКалории: {scaled_nutrients['calories']:.1f} ккал\nБелки: {scaled_nutrients['proteins']:.1f} г\nЖиры: {scaled_nutrients['fats']:.1f} г\nУглеводы: {scaled_nutrients['carbs']:.1f} г\n\nСохранить в дневнике?", buttons)
 
 # === Главное меню с командами ===
@@ -360,7 +395,7 @@ def show_main_menu(chat_id):
     requests.post(f"{API_URL}/sendMessage", data=payload)
 
 # === Обработка нажатия кнопок ===
-processed_callbacks = set()
+processed_callbacks = set()  # Избегаем повторной обработки
 
 def handle_callback(update):
     callback = update.get("callback_query", {})
@@ -391,6 +426,16 @@ def handle_callback(update):
         conn.commit()
         send_message(chat_id, f"🗑️ Запись #{entry_id} удалена из дневника.")
 
+    elif data.startswith("take_"):
+        supplement_name = data.replace("take_", "")
+        supplement = get_supplement(chat_id, supplement_name)
+        if supplement:
+            save_entry(chat_id, f"Принят бад: {supplement_name}",
+                      supplement[3], supplement[4], supplement[5], supplement[6])
+            send_message(chat_id, f"✅ Вы приняли '{supplement_name}'. Записано в дневник.")
+        else:
+            send_message(chat_id, f"❌ Бад '{supplement_name}' не найден.")
+
     elif data == "back":
         show_main_menu(chat_id)
 
@@ -402,37 +447,11 @@ def delete_message(chat_id, message_id):
 
 # === Получение обновлений от Telegram ===
 def get_updates(offset=None):
-    params = {}
+    params = {"timeout": 100}
     if offset is not None:
         params["offset"] = offset
-    params["timeout"] = 100
     response = requests.get(f"{API_URL}/getUpdates", params=params)
     return response.json().get("result", [])
-
-# === Получение всех бадов пользователя ===
-def get_all_supplements(user_id):
-    conn = sqlite3.connect("diet_diary.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM supplements WHERE user_id = ?", (user_id,))
-    return [row[0] for row in cursor.fetchall()]
-
-# === Получение бада по имени ===
-def get_supplement(user_id, name):
-    conn = sqlite3.connect("diet_diary.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM supplements WHERE user_id = ? AND name = ?", (user_id, name))
-    return cursor.fetchone()
-
-# === Сохранение бада в справочнике ===
-def save_supplement(user_id, name, description, calories, proteins, fats, carbs):
-    conn = sqlite3.connect("diet_diary.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO supplements 
-        (user_id, name, description, calories, proteins, fats, carbs) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, name, description, calories, proteins, fats, carbs))
-    conn.commit()
 
 # === Основной цикл ===
 def main():
@@ -442,13 +461,6 @@ def main():
     while True:
         updates = get_updates(last_update_id)
         for update in updates:
-            message = update.get("message", {})
-            chat_id = message["chat"]["id"]
-            from_id = message["from"]["id"]
-            text = message.get("text")
-            voice = message.get("voice")
-            photo = message.get("photo")
-
             if "message" in update:
                 handle_message(update)
                 last_update_id = update["update_id"] + 1
