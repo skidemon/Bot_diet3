@@ -1,0 +1,10 @@
+python-telegram-bot==13.7
+whisper
+pydub
+requests
+dashscope
+pillow
+speechrecognition
+sqlite3
+ffmpeg-python
+openai-whisper
