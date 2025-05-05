@@ -5,6 +5,5 @@ requests
 dashscope
 pillow
 speechrecognition
-sqlite3
 ffmpeg-python
 openai-whisper
