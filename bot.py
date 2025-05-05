@@ -9,6 +9,10 @@ import base64
 import whisper
 import re
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # === Настройки ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
